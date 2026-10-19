@@ -1,0 +1,32 @@
+# =============================================================
+# 种子数据：定义要写入 PostgreSQL 的初始租户和 API Key
+# 这份文件只给 cmd/seed 工具读取，跟网关运行时读取的 config/config.yaml
+# 是完全不同的两份文件 —— 网关进程本身启动时不会读这份文件。
+#
+# 用法：go run ./cmd/seed -config config/config.yaml -seed seed/tenants.yaml
+#
+# 说明：id 和 api_key 必须一一对应（下面 tenant-a 配 tenant-a-key）。
+# 如果两边对不上（历史上曾出现 id: tenant-d 配 tenant-a-key 的笔误），
+# 会带来一个很难查的现象：API Key 的哈希已经挂在旧租户上，
+# 新租户因为 key_hash 主键冲突拿不到这把 key，表现是"导入成功但请求 401"。
+# 如果你的库里已经有那个笔误产生的 tenant-d，先执行：
+#
+#   DELETE FROM sui_api_keys WHERE tenant_id = 'tenant-d';
+#   DELETE FROM sui_tenants  WHERE id        = 'tenant-d';
+#
+# =============================================================
+
+tenants:
+  - id: tenant-a
+    name: 订单系统A
+    api_key: tenant-a-key # 明文写在这里没问题，这是种子数据，只在本地导入时用一次
+    rps: 2
+    burst: 2
+    daily_cap: 1000
+
+  - id: tenant-b
+    name: 订单系统B
+    api_key: tenant-b-key
+    rps: 5
+    burst: 5
+    daily_cap: 5000

@@ -1,0 +1,72 @@
+# =============================================================
+# 网关运行时配置文件
+#
+# 密钥策略（重要）：
+#   这个文件可以安全地进版本库，因为它里面一个明文密码都没有。
+#   所有敏感值都写成 ${VAR} 占位符，真实值有两个来源：
+#     1. 进程环境变量（k8s Secret / docker -e / export），优先级最高
+#     2. 仓库根目录的 .env（本地开发用，已在 .gitignore 里排除）
+#
+#   插值支持两种写法：
+#     ${VAR}         取环境变量，没配就是空字符串
+#     ${VAR:-默认值} 取环境变量，没配就用默认值
+#
+#   变量清单见根目录 .env.example。
+# =============================================================
+
+server:
+  port: ${GATEWAY_PORT:-8080}
+  # 读超时：请求头+请求体读取的最长时间
+  read_timeout_seconds: 30
+  # 写超时：响应写出的最长时间。流式响应可能持续很久，这个值要给够，
+  # 否则长对话会被服务器主动掐断。
+  write_timeout_seconds: 300
+  # 请求体最大字节数，防止恶意请求发超大 body 把内存撑爆
+  max_body_bytes: 10485760 # 10MB
+
+# 日志配置
+# level:  debug / info / warn / error（线上建议 info 或 warn）
+# format: text（本地人读）/ json（日志平台采集）
+log:
+  level: ${LOG_LEVEL:-info}
+  format: ${LOG_FORMAT:-text}
+
+# Redis 配置：限流令牌桶状态 + 每日配额计数都存在这里，
+# 多个网关实例共享同一个 Redis，限流/配额才是全局生效的。
+redis:
+  addr: ${REDIS_ADDR:-localhost:6379}
+  password: ${REDIS_PASSWORD:-} # 本地开发通常没有密码
+  db: ${REDIS_DB:-0}
+  dial_timeout_ms: 2000
+  read_timeout_ms: 1000
+  write_timeout_ms: 1000
+  pool_size: 20
+
+# PostgreSQL 配置：租户主数据、API Key 的持久化存储
+postgres:
+  host: ${POSTGRES_HOST:-localhost}
+  port: ${POSTGRES_PORT:-5432}
+  user: ${POSTGRES_USER:-gateway}
+  password: ${POSTGRES_PASSWORD:-}
+  dbname: ${POSTGRES_DB:-gateway_db}
+  sslmode: ${POSTGRES_SSLMODE:-disable} # 生产环境改成 require 或更高
+
+# 模型路由表：对应"多模型路由"这个验收点
+# name 需要和请求 body 里的 "model" 字段完全一致。
+# 注意：租户配置不在这里 —— 租户数据在 PostgreSQL 里，
+# 由 cmd/seed 工具导入（见 seed/tenants.yaml）。
+models:
+  - name: qwen2.5-7b-instruct-awq
+    backend: ${BACKEND_QWEN_AWQ:-http://localhost:30800}
+
+  - name: qwen2.5
+    backend: ${BACKEND_QWEN:-http://localhost:11434}
+
+  - name: llama3
+    backend: ${BACKEND_LLAMA3:-http://localhost:11434}
+    # 如果以后接入真正的第二个后端（比如 vLLM），把 backend 换成
+    # 它的地址即可，比如 http://localhost:8000
+    # 注意：vLLM 默认走 OpenAI 兼容接口（/v1/chat/completions），
+    # 跟 Ollama 原生接口（/api/generate）请求/响应格式不同，
+    # 直接透传会有协议不匹配的问题，这个先记着，等你要接 vLLM
+    # 时我们再专门处理协议转换。
