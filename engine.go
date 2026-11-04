@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 
 	"gateway/internal/health"
@@ -37,6 +38,9 @@ type engineDeps struct {
 	metrics      *metrics.Metrics
 	prober       HealthProber
 	maxBodyBytes int64
+
+	endpoints      *router.EndpointPolicy // 对外开放的接口白名单；nil = router.DefaultEndpointPolicy()
+	trustedProxies []string               // 可信代理 IP/CIDR；空 = 不信任任何代理
 }
 
 // buildEngine 创建 gin 引擎并挂上全部路由与中间件。
@@ -45,6 +49,17 @@ func buildEngine(deps engineDeps) *gin.Engine {
 	// Logger 和 Recovery，这里我们自己实现了同类中间件（方便定制格式），
 	// 用 New() 避免重复输出两遍日志。
 	r := gin.New()
+
+	// gin 默认信任所有代理，任何客户端带个 X-Forwarded-For 就能改写 ClientIP()。
+	// 这里显式收紧。地址格式已在 config.validate 校验过，走到 panic 说明是调用方传了脏数据。
+	if err := r.SetTrustedProxies(deps.trustedProxies); err != nil {
+		panic(fmt.Errorf("trusted_proxies 非法（本应在配置校验阶段被拦下）: %w", err))
+	}
+
+	endpoints := deps.endpoints
+	if endpoints == nil {
+		endpoints = router.DefaultEndpointPolicy()
+	}
 
 	// 全局中间件：对所有路由生效，包括健康检查。
 	//
@@ -120,12 +135,24 @@ func buildEngine(deps engineDeps) *gin.Engine {
 	//                （见 middleware/quota.go 的退款逻辑），避免下游 5xx
 	//                也算到租户的每日额度上。
 	api := r.Group("/api")
+	// api.Use(
+	// 	middleware.AuthMiddleware(deps.tenantStore, deps.metrics),
+	// 	middleware.RateLimitMiddleware(deps.rateLimiter, deps.metrics),
+	// 	middleware.RoutingMiddleware(deps.modelRouter, deps.maxBodyBytes),
+	// 	middleware.QuotaMiddleware(deps.quotaTracker, deps.metrics),
+	// )
 	api.Use(
 		middleware.AuthMiddleware(deps.tenantStore, deps.metrics),
 		middleware.RateLimitMiddleware(deps.rateLimiter, deps.metrics),
+		middleware.EndpointMiddleware(endpoints),
 		middleware.RoutingMiddleware(deps.modelRouter, deps.maxBodyBytes),
 		middleware.QuotaMiddleware(deps.quotaTracker, deps.metrics),
 	)
+	//   2.5 Endpoint 接口白名单：只放行明确列出的推理接口（见 router/endpoints.go），
+	//                /api/pull、/api/delete 这类运维接口一律 404。放在 RateLimit 之后，
+	//                所以拿合法 key 扫路径同样会被限流；放在 Routing/Quota 之前，
+	//                所以被拒的请求不读 body、不消耗配额。
+
 	api.Any("/*path", proxyHandler(deps.proxyPool))
 
 	return r

@@ -17,10 +17,11 @@ import (
 
 // ServerConfig 对应 yaml 里的 server 节点
 type ServerConfig struct {
-	Port                int   `yaml:"port"`
-	ReadTimeoutSeconds  int   `yaml:"read_timeout_seconds"`
-	WriteTimeoutSeconds int   `yaml:"write_timeout_seconds"`
-	MaxBodyBytes        int64 `yaml:"max_body_bytes"`
+	Port                int      `yaml:"port"`
+	ReadTimeoutSeconds  int      `yaml:"read_timeout_seconds"`
+	WriteTimeoutSeconds int      `yaml:"write_timeout_seconds"`
+	MaxBodyBytes        int64    `yaml:"max_body_bytes"`
+	TrustedProxies      []string `yaml:"trusted_proxies"` // 可信代理 IP/CIDR；空 = 不信任任何代理
 }
 
 // RedisConfig 对应 yaml 里的 redis 节点
@@ -152,6 +153,9 @@ func (c *Config) validate() error {
 	}
 	if c.Postgres.Host == "" || c.Postgres.DBName == "" {
 		return fmt.Errorf("postgres.host 和 postgres.dbname 不能为空")
+	}
+	if err := validateTrustedProxies(c.Server.TrustedProxies); err != nil {
+		return err
 	}
 	if len(c.Models) == 0 {
 		return fmt.Errorf("至少需要配置一个模型路由")

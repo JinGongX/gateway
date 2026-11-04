@@ -97,7 +97,12 @@ func main() {
 	// 限流和配额都基于同一个 Redis 客户端，各自用不同的 key 前缀
 	// （ratelimit:xxx 和 quota:xxx）区分，互不干扰。
 	rateLimiter := ratelimit.NewRedisLimiter(redisClient)
-	quotaTracker := ratelimit.NewRedisQuotaTracker(redisClient)
+	loc, err := time.LoadLocation("Asia/Shanghai") // 容器里需要有 tzdata，或 import _ "time/tzdata"
+	if err != nil {
+		fatal(appLogger, "加载时区失败", err)
+	}
+	quotaTracker := ratelimit.NewRedisQuotaTracker(redisClient, ratelimit.WithQuotaLocation(loc))
+	//quotaTracker := ratelimit.NewRedisQuotaTracker(redisClient)
 	proxyPool := proxy.NewPool()
 
 	// 指标集合（/metrics 端点，供 Prometheus 抓取）
@@ -123,14 +128,15 @@ func main() {
 	// 具体的路由与中间件顺序放在 buildEngine（engine.go），
 	// 这样这段"顺序敏感"的逻辑可以被单元测试直接覆盖。
 	r := buildEngine(engineDeps{
-		tenantStore:  tenantStore,
-		rateLimiter:  rateLimiter,
-		quotaTracker: quotaTracker,
-		modelRouter:  modelRouter,
-		proxyPool:    proxyPool,
-		metrics:      appMetrics,
-		prober:       prober,
-		maxBodyBytes: cfg.Server.MaxBodyBytes,
+		tenantStore:    tenantStore,
+		rateLimiter:    rateLimiter,
+		quotaTracker:   quotaTracker,
+		modelRouter:    modelRouter,
+		proxyPool:      proxyPool,
+		metrics:        appMetrics,
+		prober:         prober,
+		maxBodyBytes:   cfg.Server.MaxBodyBytes,
+		trustedProxies: cfg.Server.TrustedProxies,
 	})
 
 	// ---------- 5. 启动 HTTP 服务，并支持优雅关闭 ----------

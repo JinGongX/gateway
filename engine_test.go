@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"gateway/internal/metrics"
 	"gateway/internal/middleware"
 	"gateway/internal/proxy"
+	"gateway/internal/ratelimit"
 	"gateway/internal/router"
 
 	"github.com/gin-gonic/gin"
@@ -54,15 +56,19 @@ type fakeQuota struct {
 	allowed                   bool
 	err                       error
 	consumeCalls, refundCalls int
+	consumed, refunded        []ratelimit.Reservation
 }
 
-func (f *fakeQuota) Consume(ctx context.Context, tenantID string, dailyCap int) (bool, error) {
+func (f *fakeQuota) Consume(ctx context.Context, tenantID string, dailyCap int) (ratelimit.Reservation, bool, error) {
 	f.consumeCalls++
-	return f.allowed, f.err
+	res := ratelimit.Reservation{Key: fmt.Sprintf("fake-quota-%d", f.consumeCalls)}
+	f.consumed = append(f.consumed, res)
+	return res, f.allowed, f.err
 }
 
-func (f *fakeQuota) Refund(ctx context.Context, tenantID string) (int64, error) {
+func (f *fakeQuota) Refund(ctx context.Context, res ratelimit.Reservation) (int64, error) {
 	f.refundCalls++
+	f.refunded = append(f.refunded, res)
 	return 0, nil
 }
 
