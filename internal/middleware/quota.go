@@ -9,6 +9,7 @@ package middleware
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"time"
 
 	"gateway/internal/metrics"
@@ -68,11 +69,21 @@ func QuotaMiddleware(qt QuotaTracker, m *metrics.Metrics) gin.HandlerFunc {
 			// 被拒绝的请求在 Redis 端没有被计数（见 ratelimit/quota.go），
 			// 所以这里同样没有东西需要退。
 			m.IncQuotaRejected(tenant.ID)
+
+			// 告诉调用方"还剩多少、什么时候重置"：没有这两个信息，
+			// 客户端只能盲目重试，既浪费它自己的请求，也会占用网关的限流令牌。
+			setQuotaHeaders(c, tenant.DailyCap, int64(tenant.DailyCap))
+			if s := secondsUntil(reservation.ResetAt, time.Now()); s > 0 {
+				c.Header("Retry-After", strconv.Itoa(s))
+			}
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
 				"error": "daily quota exceeded",
 			})
 			return
 		}
+
+		// 成功请求也带上剩余额度，调用方可以据此做自己的节流，不必等到被 429。
+		setQuotaHeaders(c, tenant.DailyCap, reservation.Used)
 
 		c.Next()
 
@@ -117,6 +128,19 @@ func QuotaMiddleware(qt QuotaTracker, m *metrics.Metrics) gin.HandlerFunc {
 	}
 }
 
+// setQuotaHeaders 输出 X-Quota-Limit / X-Quota-Remaining。不限额（dailyCap <= 0）时不输出。
+func setQuotaHeaders(c *gin.Context, dailyCap int, used int64) {
+	if dailyCap <= 0 {
+		return
+	}
+	remaining := int64(dailyCap) - used
+	if remaining < 0 {
+		remaining = 0
+	}
+	c.Header("X-Quota-Limit", strconv.Itoa(dailyCap))
+	c.Header("X-Quota-Remaining", strconv.FormatInt(remaining, 10))
+}
+
 // shouldRefundQuota 判断这个最终状态码对应的请求是否应该退还配额。
 //
 // 语义：只有"网关或下游自己出问题"（5xx）才不算消耗——
@@ -133,4 +157,7 @@ func shouldRefundQuota(status int) bool {
 	return status >= http.StatusInternalServerError
 }
 
-var _ QuotaTracker = (*ratelimit.RedisQuotaTracker)(nil)
+var (
+	_ QuotaTracker = (*ratelimit.RedisQuotaTracker)(nil)
+	_ QuotaTracker = (*ratelimit.FallbackQuota)(nil)
+)

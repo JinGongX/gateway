@@ -25,6 +25,7 @@ type Pool struct {
 	proxies      map[string]*httputil.ReverseProxy
 	transport    http.RoundTripper
 	upstreamAuth func(backend string) string
+	bodyIdle     time.Duration
 }
 
 // Option 用来在构造 Pool 时微调行为。
@@ -51,6 +52,13 @@ func WithTransport(rt http.RoundTripper) Option {
 // 上游（比如开了 --api-key 的 vLLM）认的是网关自己的凭证。
 func WithUpstreamAuthorization(fn func(backend string) string) Option {
 	return func(p *Pool) { p.upstreamAuth = fn }
+}
+
+// WithBodyIdleTimeout 设置"上游响应体空闲超时"：流式响应中，上游连续这么久没有吐出任何数据，
+// 就中断这次请求（见 stream.go 的 idleTimeoutBody）。<= 0 表示不启用。
+// 取值要大于模型最长的"首 token 之后的单次停顿"，通常 30~120 秒。
+func WithBodyIdleTimeout(d time.Duration) Option {
+	return func(p *Pool) { p.bodyIdle = d }
 }
 
 func NewPool(opts ...Option) *Pool {
@@ -95,6 +103,7 @@ func (p *Pool) Get(backend string) (*httputil.ReverseProxy, error) {
 	if p.upstreamAuth != nil {
 		upstreamAuth = p.upstreamAuth(backend)
 	}
+	bodyIdle := p.bodyIdle
 
 	rp := &httputil.ReverseProxy{
 		Transport: p.transport,
@@ -120,11 +129,34 @@ func (p *Pool) Get(backend string) (*httputil.ReverseProxy, error) {
 				pr.Out.Header.Set("Authorization", upstreamAuth)
 			}
 
+			// 为"上游响应体空闲超时"准备一个可取消的 context：
+			// 取消函数放进 context 里，等拿到响应后在 ModifyResponse 里取出来用。
+			if bodyIdle > 0 {
+				ctx, cancel := context.WithCancel(pr.Out.Context())
+				pr.Out = pr.Out.WithContext(context.WithValue(ctx, idleCancelKey{}, cancel))
+			}
+
 			// 保持与旧行为一致：客户端没带 User-Agent 就不要替它编一个
 			// （否则 Go 的 transport 会补上 "Go-http-client/x.y"）。
 			if _, ok := pr.Out.Header["User-Agent"]; !ok {
 				pr.Out.Header.Set("User-Agent", "")
 			}
+		},
+
+		ModifyResponse: func(resp *http.Response) error {
+			if bodyIdle <= 0 || resp.Request == nil || resp.StatusCode == http.StatusSwitchingProtocols {
+				return nil
+			}
+			cancel, ok := resp.Request.Context().Value(idleCancelKey{}).(context.CancelFunc)
+			if !ok {
+				return nil
+			}
+			reqCtx := resp.Request.Context()
+			resp.Body = newIdleTimeoutBody(resp.Body, bodyIdle, cancel, func() {
+				logger.FromContext(reqCtx).Warn("上游流式响应长时间无数据，已中断",
+					"backend", backend, "idle", bodyIdle.String())
+			})
+			return nil
 		},
 
 		// 关键配置二：后端出错时的处理（企业级网关必须有）。

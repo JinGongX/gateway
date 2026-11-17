@@ -68,8 +68,9 @@ const expireGrace = time.Hour
 
 // Reservation 记录一次成功预扣"扣在了哪里"，退款时原样传回。
 type Reservation struct {
-	Key  string // 本次扣减的 Redis key（含租户和日期）
-	Used int64  // 扣减后的今日累计用量（含本次）
+	Key     string    // 本次扣减的 Redis key（含租户和日期）
+	Used    int64     // 扣减后的今日累计用量（含本次）
+	ResetAt time.Time // 今日配额的重置时刻（下一个零点），用于 429 的 Retry-After
 }
 
 // QuotaOption 用来在构造 tracker 时调整行为。
@@ -135,8 +136,9 @@ func nextMidnight(t time.Time) time.Time {
 // 出错或被拒绝时没有任何东西被扣，调用方不应退款。
 func (qt *RedisQuotaTracker) Consume(ctx context.Context, tenantID string, dailyCap int) (Reservation, bool, error) {
 	now := qt.now().In(qt.loc)
-	res := Reservation{Key: quotaKey(tenantID, now)}
-	expireAt := nextMidnight(now).Add(expireGrace).Unix()
+	reset := nextMidnight(now)
+	res := Reservation{Key: quotaKey(tenantID, now), ResetAt: reset}
+	expireAt := reset.Add(expireGrace).Unix()
 
 	out, err := qt.consume.Run(ctx, qt.client, []string{res.Key}, dailyCap, expireAt).Slice()
 	if err != nil {

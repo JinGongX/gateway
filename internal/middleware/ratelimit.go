@@ -8,6 +8,7 @@ package middleware
 import (
 	"context"
 	"net/http"
+	"strconv"
 
 	"gateway/internal/metrics"
 	"gateway/internal/ratelimit"
@@ -29,6 +30,10 @@ type RateLimiter interface {
 // 未知模型请求、被配额拒绝的请求，都会消耗令牌。这是刻意的选择——
 // 限流保护的是网关自身的处理容量，而任何到达网关的请求都已经占用了容量。
 // 真正跟钱挂钩的配额，采用的是另一套语义（见 quota.go）。
+//
+// 降级：生产环境应传入 ratelimit.FallbackLimiter（Redis 故障时退化为本地令牌桶），
+// 这样 Redis 出错时不是"无限放行"而是"每副本按份额放行"。
+// 下面 err != nil 的 fail-open 分支只会在没有包装兜底限流器时才会走到。
 func RateLimitMiddleware(rl RateLimiter, m *metrics.Metrics) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		tenant, ok := tenantFromContext(c)
@@ -56,6 +61,8 @@ func RateLimitMiddleware(rl RateLimiter, m *metrics.Metrics) gin.HandlerFunc {
 		if !allowed {
 			// 限流拒绝率是判断"要不要扩容/要不要调额度"的核心指标
 			m.IncRateLimited(tenant.ID)
+			// Retry-After 让客户端能做指数退避而不是疯狂重试（重试风暴会让限流更严重）
+			c.Header("Retry-After", strconv.Itoa(retryAfterForRate(tenant.RPS)))
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
 				"error": "rate limit exceeded",
 			})
@@ -65,7 +72,10 @@ func RateLimitMiddleware(rl RateLimiter, m *metrics.Metrics) gin.HandlerFunc {
 	}
 }
 
-// 让 *ratelimit.RedisLimiter 自动满足上面的接口。
-// 这是一行编译期断言：如果哪天 RedisLimiter 的 Allow 签名改了，
-// 这里会立刻编译失败，而不是等运行到 main.go 组装时才报错。
-var _ RateLimiter = (*ratelimit.RedisLimiter)(nil)
+// 让 *ratelimit.RedisLimiter 与带兜底的 FallbackLimiter 自动满足上面的接口。
+// 这是编译期断言：如果哪天 Allow 的签名改了，这里会立刻编译失败，
+// 而不是等运行到 main.go 组装时才报错。
+var (
+	_ RateLimiter = (*ratelimit.RedisLimiter)(nil)
+	_ RateLimiter = (*ratelimit.FallbackLimiter)(nil)
+)

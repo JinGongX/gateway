@@ -22,6 +22,12 @@ type ServerConfig struct {
 	WriteTimeoutSeconds int      `yaml:"write_timeout_seconds"`
 	MaxBodyBytes        int64    `yaml:"max_body_bytes"`
 	TrustedProxies      []string `yaml:"trusted_proxies"` // 可信代理 IP/CIDR；空 = 不信任任何代理
+
+	StreamWriteTimeoutSeconds int `yaml:"stream_write_timeout_seconds"` // 流式响应单次写的最长等待；0 = 用默认 30
+	MaxStreamSeconds          int `yaml:"max_stream_seconds"`           // 单个流的总时长上限；0 = 用默认 900
+	DrainSeconds              int `yaml:"drain_seconds"`                // 收到 SIGTERM 后先摘流量的等待；0 = 用默认 5
+	ShutdownGraceSeconds      int `yaml:"shutdown_grace_seconds"`       // 等待在途请求完成的上限；0 = max_stream + 30
+	ExpectedReplicas          int `yaml:"expected_replicas"`
 }
 
 // RedisConfig 对应 yaml 里的 redis 节点
@@ -43,6 +49,17 @@ type PostgresConfig struct {
 	Password string `yaml:"password"`
 	DBName   string `yaml:"dbname"`
 	SSLMode  string `yaml:"sslmode"` // 本地开发用 disable，生产环境应该用 require 或更高
+}
+
+// UpstreamConfig 对应 yaml 里的 upstream 节点：到模型后端的连接与超时。
+// 零值字段使用 proxy.TransportConfig 里的默认值。
+type UpstreamConfig struct {
+	DialTimeoutMs                int `yaml:"dial_timeout_ms"`
+	ResponseHeaderTimeoutSeconds int `yaml:"response_header_timeout_seconds"`
+	StreamIdleTimeoutSeconds     int `yaml:"stream_idle_timeout_seconds"` // 流式响应中上游连续无数据的最长时间；0 = 不启用
+	IdleConnTimeoutSeconds       int `yaml:"idle_conn_timeout_seconds"`
+	MaxIdleConnsPerHost          int `yaml:"max_idle_conns_per_host"`
+	MaxConnsPerHost              int `yaml:"max_conns_per_host"`
 }
 
 // DSN 拼出 pgx 连接池能识别的连接字符串。
@@ -88,6 +105,8 @@ type Config struct {
 	Redis    RedisConfig    `yaml:"redis"`
 	Postgres PostgresConfig `yaml:"postgres"`
 	Models   []ModelConfig  `yaml:"models"`
+
+	Upstream UpstreamConfig `yaml:"upstream"`
 }
 
 // Load 从指定路径读取并解析 yaml 配置文件。
@@ -155,6 +174,22 @@ func (c *Config) validate() error {
 		return fmt.Errorf("postgres.host 和 postgres.dbname 不能为空")
 	}
 	if err := validateTrustedProxies(c.Server.TrustedProxies); err != nil {
+		return err
+	}
+	if err := validateNonNegative(map[string]int{
+		"server.write_timeout_seconds":             c.Server.WriteTimeoutSeconds,
+		"server.stream_write_timeout_seconds":      c.Server.StreamWriteTimeoutSeconds,
+		"server.max_stream_seconds":                c.Server.MaxStreamSeconds,
+		"server.drain_seconds":                     c.Server.DrainSeconds,
+		"server.shutdown_grace_seconds":            c.Server.ShutdownGraceSeconds,
+		"server.expected_replicas":                 c.Server.ExpectedReplicas,
+		"upstream.dial_timeout_ms":                 c.Upstream.DialTimeoutMs,
+		"upstream.response_header_timeout_seconds": c.Upstream.ResponseHeaderTimeoutSeconds,
+		"upstream.stream_idle_timeout_seconds":     c.Upstream.StreamIdleTimeoutSeconds,
+		"upstream.idle_conn_timeout_seconds":       c.Upstream.IdleConnTimeoutSeconds,
+		"upstream.max_idle_conns_per_host":         c.Upstream.MaxIdleConnsPerHost,
+		"upstream.max_conns_per_host":              c.Upstream.MaxConnsPerHost,
+	}); err != nil {
 		return err
 	}
 	if len(c.Models) == 0 {

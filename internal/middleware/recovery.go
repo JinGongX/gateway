@@ -11,6 +11,7 @@
 package middleware
 
 import (
+	"errors"
 	"net/http"
 	"runtime/debug"
 
@@ -31,6 +32,25 @@ func RecoveryMiddleware(counter panicCounter) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		defer func() {
 			if err := recover(); err != nil {
+				// http.ErrAbortHandler 不是 bug，而是 net/http 约定的"中止这次响应"信号。
+				// 流式转发中途出问题（客户端断开、写超时、上游中断）时，
+				// httputil.ReverseProxy 会主动 panic(http.ErrAbortHandler)，
+				// 目的是让 net/http 直接断开连接，客户端据此知道"流被截断了"。
+				//
+				// 如果在这里把它当成普通 panic 吞掉并"体面地"返回，会有两个后果：
+				//  1. gateway_panics_total 被每一次客户端断开刷高，真正的 panic 告警被淹没；
+				//  2. 被截断的流会以一个正常的 chunked 结尾收尾，客户端把残缺的输出当成完整结果。
+				// 所以：记一条 Warn（不是 Error，更没有堆栈），不计入 panic，然后原样重新抛出。
+				if e, ok := err.(error); ok && errors.Is(e, http.ErrAbortHandler) {
+					loggerFromContext(c).Warn("响应在传输中被中断",
+						"method", c.Request.Method,
+						"path", c.Request.URL.Path,
+						"status", c.Writer.Status(),
+						"bytes", c.Writer.Size(),
+					)
+					panic(err)
+				}
+
 				if counter != nil {
 					counter.IncPanic()
 				}

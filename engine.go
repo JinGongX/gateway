@@ -11,6 +11,8 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sync"
+	"time"
 
 	"gateway/internal/health"
 	"gateway/internal/logger"
@@ -41,6 +43,10 @@ type engineDeps struct {
 
 	endpoints      *router.EndpointPolicy // 对外开放的接口白名单；nil = router.DefaultEndpointPolicy()
 	trustedProxies []string               // 可信代理 IP/CIDR；空 = 不信任任何代理
+
+	drainer         *health.Drainer // 优雅关闭时置为 draining；nil 表示永不下线（测试用）
+	streamWriteIdle time.Duration   // 流式响应滚动写超时；0 = 不启用
+	maxStream       time.Duration   // 单个流总时长上限；0 = 不限制
 }
 
 // buildEngine 创建 gin 引擎并挂上全部路由与中间件。
@@ -90,6 +96,11 @@ func buildEngine(deps engineDeps) *gin.Engine {
 	// 依赖不可用时返回 503，负载均衡会把本实例摘出去（但不会重启它），
 	// 等依赖恢复后自动重新加入。
 	r.GET("/readyz", func(c *gin.Context) {
+		if deps.drainer.Draining() {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "draining"})
+			return
+		}
+
 		results, healthy := deps.prober.Run(c.Request.Context())
 
 		if !healthy {
@@ -153,14 +164,17 @@ func buildEngine(deps engineDeps) *gin.Engine {
 	//                所以拿合法 key 扫路径同样会被限流；放在 Routing/Quota 之前，
 	//                所以被拒的请求不读 body、不消耗配额。
 
-	api.Any("/*path", proxyHandler(deps.proxyPool))
+	//api.Any("/*path", proxyHandler(deps.proxyPool))
+	api.Any("/*path", proxyHandler(deps.proxyPool, deps.streamWriteIdle, deps.maxStream))
 
 	return r
 }
 
 // proxyHandler 是最终的转发处理函数：从 context 里取出路由中间件
 // 解析好的后端地址，用对应的 ReverseProxy 转发请求。
-func proxyHandler(pool *proxy.Pool) gin.HandlerFunc {
+func proxyHandler(pool *proxy.Pool, streamWriteIdle, maxStream time.Duration) gin.HandlerFunc {
+	var warnOnce sync.Once // 保护未生效的告警只打一次，避免每个请求都刷屏
+
 	return func(c *gin.Context) {
 		backendVal, ok := c.Get(middleware.BackendContextKey)
 		if !ok {
@@ -169,9 +183,6 @@ func proxyHandler(pool *proxy.Pool) gin.HandlerFunc {
 			})
 			return
 		}
-		// 注意这里也做了 ok 判断：如果有人往 context 里塞了别的类型
-		// （或者把 key 写错），裸断言会 panic，判断一下只是多两行代码，
-		// 但能换回一个明确的错误响应。
 		backend, ok := backendVal.(string)
 		if !ok || backend == "" {
 			c.JSON(http.StatusInternalServerError, gin.H{
@@ -188,13 +199,27 @@ func proxyHandler(pool *proxy.Pool) gin.HandlerFunc {
 			return
 		}
 
-		// 转发前的最后一步：记一条 debug 日志（线上默认 info 级别不会输出，
-		// 排查问题临时把 LOG_LEVEL 调成 debug 就能看到每次转发的目标地址）
 		logger.FromContext(c.Request.Context()).Debug("转发到模型后端",
 			"backend", backend,
 			"path", c.Request.URL.Path,
 		)
 
-		rp.ServeHTTP(c.Writer, c.Request)
+		// 用滚动写超时代替 http.Server.WriteTimeout（见 proxy/stream.go）。
+		var w http.ResponseWriter = c.Writer
+		if streamWriteIdle > 0 || maxStream > 0 {
+			dw := proxy.NewDeadlineWriter(c.Writer, streamWriteIdle, maxStream)
+			w = dw
+			defer func() {
+				if dw.Unsupported() {
+					warnOnce.Do(func() {
+						logger.FromContext(c.Request.Context()).Warn(
+							"底层 ResponseWriter 不支持设置写超时，流式写超时保护未生效；" +
+								"请检查 gin 版本以及中间件链里是否有包装 ResponseWriter 却没有实现 Unwrap 的中间件")
+					})
+				}
+			}()
+		}
+
+		rp.ServeHTTP(w, c.Request)
 	}
 }

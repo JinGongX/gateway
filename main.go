@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -96,17 +97,58 @@ func main() {
 
 	// 限流和配额都基于同一个 Redis 客户端，各自用不同的 key 前缀
 	// （ratelimit:xxx 和 quota:xxx）区分，互不干扰。
-	rateLimiter := ratelimit.NewRedisLimiter(redisClient)
-	loc, err := time.LoadLocation("Asia/Shanghai") // 容器里需要有 tzdata，或 import _ "time/tzdata"
-	if err != nil {
-		fatal(appLogger, "加载时区失败", err)
-	}
-	quotaTracker := ratelimit.NewRedisQuotaTracker(redisClient, ratelimit.WithQuotaLocation(loc))
-	//quotaTracker := ratelimit.NewRedisQuotaTracker(redisClient)
-	proxyPool := proxy.NewPool()
+	// rateLimiter := ratelimit.NewRedisLimiter(redisClient)
+	// loc, err := time.LoadLocation("Asia/Shanghai") // 容器里需要有 tzdata，或 import _ "time/tzdata"
+	// if err != nil {
+	// 	fatal(appLogger, "加载时区失败", err)
+	// }
+	// quotaTracker := ratelimit.NewRedisQuotaTracker(redisClient, ratelimit.WithQuotaLocation(loc))
+	// //quotaTracker := ratelimit.NewRedisQuotaTracker(redisClient)
+	// proxyPool := proxy.NewPool()
 
 	// 指标集合（/metrics 端点，供 Prometheus 抓取）
 	appMetrics := metrics.New()
+	secs := func(n int) time.Duration { return time.Duration(n) * time.Second }
+	secsOr := func(n, def int) time.Duration {
+		if n <= 0 {
+			n = def
+		}
+		return secs(n)
+	}
+
+	// Redis 故障时的降级：限流和配额都退化为"每个副本在内存里各限 1/N"，
+	// 不再是无限放行。每次降级记指标；日志按 10 秒采样，避免故障期间刷屏。
+	var lastFallbackLog atomic.Int64
+	onFallback := func(component string) ratelimit.FallbackNotify {
+		return func(tenantID string, err error) {
+			appMetrics.IncRedisFallback(component)
+			now := time.Now().UnixNano()
+			last := lastFallbackLog.Load()
+			if now-last >= int64(10*time.Second) && lastFallbackLog.CompareAndSwap(last, now) {
+				appLogger.Warn("Redis 不可用，已降级为本地限流/配额",
+					"component", component, "tenant", tenantID, "err", err)
+			}
+		}
+	}
+	replicas := cfg.Server.ExpectedReplicas
+	rateLimiter := ratelimit.NewFallbackLimiter(ratelimit.NewRedisLimiter(redisClient), replicas, onFallback("ratelimit"))
+	quotaTracker := ratelimit.NewFallbackQuota(ratelimit.NewRedisQuotaTracker(redisClient), replicas, onFallback("quota"))
+
+	proxyPool := proxy.NewPool(
+		proxy.WithTransport(proxy.NewTransport(proxy.TransportConfig{
+			DialTimeout:           time.Duration(cfg.Upstream.DialTimeoutMs) * time.Millisecond,
+			ResponseHeaderTimeout: secs(cfg.Upstream.ResponseHeaderTimeoutSeconds),
+			IdleConnTimeout:       secs(cfg.Upstream.IdleConnTimeoutSeconds),
+			MaxIdleConnsPerHost:   cfg.Upstream.MaxIdleConnsPerHost,
+			MaxConnsPerHost:       cfg.Upstream.MaxConnsPerHost,
+		})),
+		proxy.WithBodyIdleTimeout(secs(cfg.Upstream.StreamIdleTimeoutSeconds)),
+	)
+
+	drainer := &health.Drainer{}
+
+	// // 指标集合（/metrics 端点，供 Prometheus 抓取）
+	// appMetrics := metrics.New()
 
 	// 就绪探针的检查项。
 	// 超时 2 秒：依赖卡住时探针要能及时返回失败，而不是跟着一起挂住；
@@ -137,6 +179,10 @@ func main() {
 		prober:         prober,
 		maxBodyBytes:   cfg.Server.MaxBodyBytes,
 		trustedProxies: cfg.Server.TrustedProxies,
+
+		drainer:         drainer,
+		streamWriteIdle: secsOr(cfg.Server.StreamWriteTimeoutSeconds, 30),
+		maxStream:       secsOr(cfg.Server.MaxStreamSeconds, 900),
 	})
 
 	// ---------- 5. 启动 HTTP 服务，并支持优雅关闭 ----------
@@ -144,11 +190,19 @@ func main() {
 	// （比如 K8s 滚动更新时发的 SIGTERM）时，应该拒绝新请求，但把正在
 	// 处理中的请求（尤其是长时间的流式响应）处理完再退出，而不是
 	// 粗暴地直接杀掉进程导致用户请求半途中断。
+	// srv := &http.Server{
+	// 	Addr:         fmt.Sprintf(":%d", cfg.Server.Port),
+	// 	Handler:      r,
+	// 	ReadTimeout:  time.Duration(cfg.Server.ReadTimeoutSeconds) * time.Second,
+	// 	WriteTimeout: time.Duration(cfg.Server.WriteTimeoutSeconds) * time.Second,
+	// }
 	srv := &http.Server{
-		Addr:         fmt.Sprintf(":%d", cfg.Server.Port),
-		Handler:      r,
-		ReadTimeout:  time.Duration(cfg.Server.ReadTimeoutSeconds) * time.Second,
-		WriteTimeout: time.Duration(cfg.Server.WriteTimeoutSeconds) * time.Second,
+		Addr:              fmt.Sprintf(":%d", cfg.Server.Port),
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second, // 防 slowloris：请求头必须在 10 秒内发完
+		ReadTimeout:       secs(cfg.Server.ReadTimeoutSeconds),
+		WriteTimeout:      secs(cfg.Server.WriteTimeoutSeconds), // 0 = 关闭，由 DeadlineWriter 接管
+		IdleTimeout:       120 * time.Second,
 	}
 
 	go func() {
@@ -161,15 +215,25 @@ func main() {
 	// 监听系统信号，收到 Ctrl+C（SIGINT）或者 kill（SIGTERM）时触发优雅关闭
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	// <-quit
+	// appLogger.Info("收到关闭信号，开始优雅关闭")
+
+	// // 给正在处理中的请求最多 10 秒时间完成，超时则强制关闭
+	// ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// defer cancel()
+
+	// if err := srv.Shutdown(ctx); err != nil {
+	// 	fatal(appLogger, "优雅关闭超时，强制退出", err)
+	// }
+	// appLogger.Info("网关已安全关闭")
 	<-quit
-	appLogger.Info("收到关闭信号，开始优雅关闭")
 
-	// 给正在处理中的请求最多 10 秒时间完成，超时则强制关闭
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	if err := srv.Shutdown(ctx); err != nil {
-		fatal(appLogger, "优雅关闭超时，强制退出", err)
+	grace := secs(cfg.Server.ShutdownGraceSeconds)
+	if cfg.Server.ShutdownGraceSeconds <= 0 {
+		grace = secsOr(cfg.Server.MaxStreamSeconds, 900) + 30*time.Second
+	}
+	if err := gracefulShutdown(srv, drainer, secsOr(cfg.Server.DrainSeconds, 5), grace, appLogger); err != nil {
+		fatal(appLogger, "优雅关闭失败", err)
 	}
 	appLogger.Info("网关已安全关闭")
 }

@@ -46,6 +46,8 @@ type Metrics struct {
 	rateLimited     *prometheus.CounterVec
 	quotaRejected   *prometheus.CounterVec
 	quotaRefunds    *prometheus.CounterVec
+
+	redisFallback *prometheus.CounterVec
 }
 
 // New 创建指标集合，并注册 Go 运行时/进程自身的指标
@@ -104,6 +106,12 @@ func New() *Metrics {
 			Name:      "quota_refunds_total",
 			Help:      "配额退款次数，按结果分类（ok / failed）。failed 说明 Redis 有问题，账目可能不准",
 		}, []string{"result"}),
+
+		redisFallback: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "redis_fallback_total",
+			Help:      "Redis 不可用导致降级到本地限流/配额的次数，按组件分类（ratelimit / quota）。持续增长说明 Redis 故障中，租户额度只被本地粗略限制",
+		}, []string{"component"}),
 	}
 
 	registry.MustRegister(
@@ -115,6 +123,7 @@ func New() *Metrics {
 		m.rateLimited,
 		m.quotaRejected,
 		m.quotaRefunds,
+		m.redisFallback,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
@@ -185,4 +194,9 @@ func statusLabel(status int) string {
 		return "unknown"
 	}
 	return strconv.Itoa(status)
+}
+
+// IncRedisFallback 记录一次"Redis 不可用，已降级到本地"。component 取值有限（ratelimit / quota）。
+func (m *Metrics) IncRedisFallback(component string) {
+	m.redisFallback.WithLabelValues(component).Inc()
 }

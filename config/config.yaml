@@ -20,7 +20,21 @@ server:
   read_timeout_seconds: 30
   # 写超时：响应写出的最长时间。流式响应可能持续很久，这个值要给够，
   # 否则长对话会被服务器主动掐断。
-  write_timeout_seconds: 300
+  #write_timeout_seconds: 300
+  # 整体写超时：设为 0（关闭）。http.Server.WriteTimeout 是从请求头读完开始计时的绝对期限，
+  # 300 秒就意味着任何超过 300 秒的流式响应都会被服务器强行截断。
+  # 改由下面两项控制：滚动的"单次写超时"（防慢客户端）和单个流的总时长上限（防无限生成占 GPU）。
+  write_timeout_seconds: 0
+  stream_write_timeout_seconds: 30
+  max_stream_seconds: 900
+  # 优雅关闭：收到 SIGTERM 后，先让 /readyz 返回 503 并等 drain_seconds（让 LB 摘流量），
+  # 再等在途请求完成最多 shutdown_grace_seconds（0 = max_stream_seconds + 30）。
+  # K8s 的 terminationGracePeriodSeconds 必须 >= drain_seconds + shutdown_grace_seconds。
+  drain_seconds: 5
+  shutdown_grace_seconds: 0
+  # 网关副本数。Redis 故障时，每个副本只放行 1/expected_replicas 的限流/配额份额。
+  expected_replicas: 1
+
   # 请求体最大字节数，防止恶意请求发超大 body 把内存撑爆
   max_body_bytes: 10485760 # 10MB
   # 可信代理（IP 或 CIDR）。网关只会采纳来自这些地址的 X-Forwarded-For / X-Real-IP。
@@ -75,3 +89,14 @@ models:
     # 跟 Ollama 原生接口（/api/generate）请求/响应格式不同，
     # 直接透传会有协议不匹配的问题，这个先记着，等你要接 vLLM
     # 时我们再专门处理协议转换。
+
+# 到模型后端的连接池与超时。0 = 使用内置默认值。
+upstream:
+  dial_timeout_ms: 3000
+  # 非流式（stream:false）请求要等整段生成完才有响应头，所以这里必须 >= 最长单次生成耗时
+  response_header_timeout_seconds: 300
+  # 流式响应中，上游连续这么久没吐出任何数据就中断（后端假死保护）
+  stream_idle_timeout_seconds: 60
+  idle_conn_timeout_seconds: 90
+  max_idle_conns_per_host: 64
+  max_conns_per_host: 0   # 0 = 不限制；想给单个后端做硬性并发上限时再设置
